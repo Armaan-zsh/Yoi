@@ -4,7 +4,6 @@ A custom **Spotlight-like launcher** for Windows, built with Python & Tkinter.
 
 ✨ Features:
 - 🔍 Search and launch installed apps (with fuzzy matching)
-- 🖼️ Shows real app icons
 - 🧮 Calculator built-in
 - 🌐 Open URLs or search the web
 - 🎨 Matte black / Hyperland-style UI
