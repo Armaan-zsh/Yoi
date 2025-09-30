@@ -1,5 +1,7 @@
-# spotlight.py — Spotlight clone for Windows
+# spotlight.py — Spotlight clone for Windows (FULLY FIXED)
 # Dependencies: pip install pywin32 pillow keyboard rapidfuzz pyperclip
+# spotlight.py — Spotlight clone for Windows
+# Dependencies (optional): pywin32 pillow keyboard rapidfuzz pyperclip
 
 import os
 import threading
@@ -9,27 +11,48 @@ import webbrowser
 import re
 import ctypes
 from ctypes import wintypes
-from PIL import Image, ImageTk
-import win32com.client
-import win32ui
-import win32gui
-import win32con
+import sys
+import time
 
+# Optional Pillow
+try:
+    from PIL import Image, ImageTk, ImageDraw
+except Exception:
+    Image = ImageTk = ImageDraw = None
+
+# Optional pywin32 (Windows-only features)
+HAS_PYWIN32 = False
+try:
+    import win32com.client
+    import win32ui
+    import win32gui
+    import win32con
+    import win32api
+    HAS_PYWIN32 = True
+except Exception:
+    win32com = win32ui = win32gui = win32con = win32api = None
+
+# Optional rapidfuzz
 try:
     from rapidfuzz import process, fuzz
 except Exception:
     process = None
     fuzz = None
 
-import keyboard
-import pyperclip
-
-# ------------- CONFIG -------------
-HOTKEY = "alt+space"
+# Optional keyboard and pyperclip
+try:
+    import keyboard
+except Exception:
+    keyboard = None
+try:
+    import pyperclip
+except Exception:
+    pyperclip = None
 INDEX_PATHS = [
-    os.path.expandvars(r"%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs"),
-    r"C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs"
+    os.path.expandvars(r"%APPDATA%\Microsoft\Windows\Start Menu\Programs"),
+    r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs"
 ]
+HOTKEY = "ctrl+space"
 MAX_RESULTS = 8
 SEARCH_DEBOUNCE_MS = 120
 WINDOW_WIDTH = 820
@@ -51,6 +74,19 @@ COLORS = {
     "subtle_text": "#7f7f7f"
 }
 
+# ---------- SYSTEM APPS ----------
+SYSTEM_APPS = [
+    {"name": "Notepad", "exe": "notepad.exe"},
+    {"name": "Calculator", "exe": "calc.exe"},
+    {"name": "Paint", "exe": "mspaint.exe"},
+    {"name": "Command Prompt", "exe": "cmd.exe"},
+    {"name": "Windows PowerShell", "exe": "powershell.exe"},
+    {"name": "Task Manager", "exe": "taskmgr.exe"},
+    {"name": "Control Panel", "exe": "control.exe"},
+    {"name": "Registry Editor", "exe": "regedit.exe"},
+    {"name": "System Information", "exe": "msinfo32.exe"},
+]
+
 # ---------- GLOBALS ----------
 apps = []
 icon_cache = {}
@@ -64,7 +100,9 @@ selected_index = -1
 _search_after_id = None
 _origin_x = None
 _origin_y = None
-backspace_empty_count = 0  # for double-backspace close
+backspace_empty_count = 0
+_hotkey_registered = False
+_default_icon = None  # Will be set after Tk init
 
 # ---------- WINDOWS BLUR & ROUNDED ----------
 def enable_blur(hwnd):
@@ -105,35 +143,60 @@ def round_corners(hwnd):
         pass
 
 # ---------- ICON EXTRACTION ----------
-def extract_icon(path, size=ICON_SIZE):
-    """Extract app icon from exe/lnk and return a Tkinter PhotoImage."""
-    if not os.path.exists(path):
+def create_default_icon():
+    """Create a fallback icon if extraction fails."""
+    global _default_icon
+    if _default_icon is not None:
+        return _default_icon
+    try:
+        if Image is None or ImageTk is None or ImageDraw is None:
+            _default_icon = None
+            return None
+        img = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (60, 60, 60, 255))
+        draw = ImageDraw.Draw(img)
+        draw.text((ICON_SIZE//3, ICON_SIZE//4), "A", fill=(200, 200, 200, 255), font=None)
+        _default_icon = ImageTk.PhotoImage(img)
+        return _default_icon
+    except:
+        # Fallback to text if PIL.ImageDraw fails
         return None
+
+def extract_icon(path, size=ICON_SIZE):
+    if not os.path.exists(path) or not HAS_PYWIN32:
+        return create_default_icon()
     if path in icon_cache:
         return icon_cache[path]
 
     try:
         hicon = None
-        # Try first 5 icon indexes
         for i in range(5):
             large, small = win32gui.ExtractIconEx(path, i)
             if small:
-                hicon = small[0]; break
+                hicon = small[0]
+                if large:
+                    win32gui.DestroyIcon(large[0])
+                break
             elif large:
-                hicon = large[0]; break
+                hicon = large[0]
+                break
 
         if not hicon:
-            return None
+            icon_cache[path] = create_default_icon()
+            return icon_cache[path]
 
         hdc = win32ui.CreateDCFromHandle(win32gui.GetDC(0))
         hbmp = win32ui.CreateBitmap()
         hbmp.CreateCompatibleBitmap(hdc, size, size)
-        hdc = hdc.CreateCompatibleDC()
-        hdc.SelectObject(hbmp)
-        win32gui.DrawIconEx(hdc.GetHandleOutput(), 0, 0, hicon, size, size, 0, 0, win32con.DI_NORMAL)
+        hdc_mem = hdc.CreateCompatibleDC()
+        hdc_mem.SelectObject(hbmp)
+        win32gui.DrawIconEx(hdc_mem.GetHandleOutput(), 0, 0, hicon, size, size, 0, 0, win32con.DI_NORMAL)
 
         bmpinfo = hbmp.GetInfo()
         bmpstr = hbmp.GetBitmapBits(True)
+        if Image is None:
+            win32gui.DestroyIcon(hicon)
+            icon_cache[path] = None
+            return None
         img = Image.frombuffer("RGB", (bmpinfo["bmWidth"], bmpinfo["bmHeight"]),
                                bmpstr, "raw", "BGRX", 0, 1)
         img = img.resize((size, size), Image.LANCZOS)
@@ -143,14 +206,22 @@ def extract_icon(path, size=ICON_SIZE):
         tk_img = ImageTk.PhotoImage(img)
         icon_cache[path] = tk_img
         return tk_img
-    except Exception:
-        return None
+    except Exception as e:
+        print(f"[icon] failed for {path}: {e}")
+        fallback = create_default_icon()
+        icon_cache[path] = fallback
+        return fallback
 
 # ---------- INDEX REAL APPS ----------
-def index_apps():
+def index_apps(extract_icons=False):
     global apps
     apps = []
-    shell = win32com.client.Dispatch("WScript.Shell")
+    # If pywin32 is available, resolve .lnk targets; otherwise add .lnk entries without resolving
+    if HAS_PYWIN32:
+        try:
+            shell = win32com.client.Dispatch("WScript.Shell")
+        except Exception:
+            shell = None
 
     for base in INDEX_PATHS:
         if os.path.exists(base):
@@ -158,21 +229,49 @@ def index_apps():
                 for f in files:
                     if f.lower().endswith(".lnk"):
                         full_path = os.path.join(root, f)
-                        try:
-                            shortcut = shell.CreateShortcut(full_path)
-                            target = shortcut.Targetpath
-                            if target and os.path.exists(target) and target.lower().endswith(".exe"):
-                                icon_img = extract_icon(target) or extract_icon(full_path)
-                                apps.append({
-                                    "name": os.path.splitext(f)[0],
-                                    "path": full_path,
-                                    "target": target,
-                                    "type": "app",
-                                    "icon": icon_img
-                                })
-                        except Exception:
-                            continue
+                        target = None
+                        if HAS_PYWIN32 and 'shell' in locals() and shell is not None:
+                            try:
+                                shortcut = shell.CreateShortcut(full_path)
+                                target = shortcut.Targetpath
+                            except Exception:
+                                target = None
+                        icon_img = None
+                        if extract_icons and target:
+                            icon_img = extract_icon(target) or extract_icon(full_path)
+                        apps.append({
+                            "name": os.path.splitext(f)[0],
+                            "path": full_path,
+                            "target": target,
+                            "type": "app",
+                            "icon": icon_img
+                        })
+
+    # Add system apps
+    system32 = os.path.expandvars(r"%windir%\system32")
+    for app in SYSTEM_APPS:
+        exe_path = os.path.join(system32, app["exe"])
+        if os.path.exists(exe_path):
+            icon_img = extract_icon(exe_path) if extract_icons and HAS_PYWIN32 else None
+            apps.append({
+                "name": app["name"],
+                "path": exe_path,
+                "target": exe_path,
+                "type": "system",
+                "icon": icon_img
+            })
+
     print(f"[spotlight] indexed {len(apps)} apps")
+
+# ---------- BACKGROUND ICON LOADER ----------
+def preload_icons_background():
+    """Preload all icons in background after Tk is ready."""
+    time.sleep(0.5)  # Ensure UI is stable
+    print("[spotlight] preloading icons in background...")
+    for app in apps:
+        if app["icon"] is None:
+            app["icon"] = extract_icon(app["path"]) or extract_icon(app.get("target", ""))
+    print("[spotlight] icon preloading complete")
 
 # ---------- HELPERS ----------
 def is_url(text: str) -> bool:
@@ -210,14 +309,32 @@ def set_origin_for_entry():
 
 # ---------- UI CREATION ----------
 def create_search_window():
-    global search_window, entry, canvas, placeholder_label
+    global search_window, entry, canvas, placeholder_label, _default_icon
     search_window = tk.Tk()
     search_window.withdraw()
     search_window.overrideredirect(True)
     search_window.attributes("-topmost", True)
     search_window.configure(bg=COLORS["win_bg"])
+    
+    # Make it a tool window to avoid taskbar
+    hwnd = ctypes.windll.user32.GetParent(search_window.winfo_id())
+    style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
+    style |= 0x00000080  # WS_EX_TOOLWINDOW
+    style &= ~0x00040000  # Remove WS_EX_APPWINDOW
+    ctypes.windll.user32.SetWindowLongW(hwnd, -20, style)
+
     search_window.update_idletasks()
     set_origin_for_entry()
+
+    # Initialize default icon now that Tk exists
+    try:
+        from PIL import ImageDraw
+        img = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (60, 60, 60))
+        draw = ImageDraw.Draw(img)
+        draw.text((ICON_SIZE//3, ICON_SIZE//4), "A", fill=(200, 200, 200))
+        _default_icon = ImageTk.PhotoImage(img)
+    except:
+        _default_icon = None
 
     try:
         hwnd = search_window.winfo_id()
@@ -267,6 +384,11 @@ def show_results(results):
         search_window.geometry(f"{WINDOW_WIDTH}x{ENTRY_HEIGHT}+{_origin_x}+{_origin_y}")
         return
 
+    # Ensure icons are loaded (fallback if missing)
+    for r in results:
+        if r.get("icon") is None:
+            r["icon"] = extract_icon(r.get("path", "")) or _default_icon
+
     new_h = ENTRY_HEIGHT + len(results) * RESULT_ITEM_HEIGHT + 20
     sw = search_window.winfo_screenheight()
     origin_y = min(_origin_y, sw - new_h - 20)
@@ -278,9 +400,10 @@ def show_results(results):
         frame = tk.Frame(search_window, bg=bg, height=RESULT_ITEM_HEIGHT, bd=0)
         frame.place(x=16, y=top_y + i * RESULT_ITEM_HEIGHT, width=WINDOW_WIDTH - 32, height=RESULT_ITEM_HEIGHT)
 
-        if isinstance(r.get("icon"), ImageTk.PhotoImage):
-            icon_label = tk.Label(frame, image=r["icon"], bg=bg)
-            icon_label.image = r["icon"]
+        icon_to_show = r.get("icon") or _default_icon
+        if isinstance(icon_to_show, ImageTk.PhotoImage):
+            icon_label = tk.Label(frame, image=icon_to_show, bg=bg)
+            icon_label.image = icon_to_show
         else:
             icon_label = tk.Label(frame, text="", font=("Segoe UI Symbol", 16), bg=bg, fg=COLORS["entry_fg"])
         icon_label.place(x=12, y=12, width=36)
@@ -338,11 +461,13 @@ def perform_search():
             if score >= 40:
                 a = next((x for x in apps if x["name"] == m), None)
                 if a:
-                    results.append({"name": a["name"], "type": "app", "icon": a["icon"], "action": lambda p=a["path"]: os.startfile(p)})
+                    action = (lambda p=a["path"]: os.startfile(p)) if a["type"] != "system" else (lambda p=a["path"]: win32api.ShellExecute(0, "open", p, None, None, 1))
+                    results.append({"name": a["name"], "type": a["type"], "icon": a["icon"], "action": action})
     else:
         for a in apps:
             if q.lower() in a["name"].lower():
-                results.append({"name": a["name"], "type": "app", "icon": a["icon"], "action": lambda p=a["path"]: os.startfile(p)})
+                action = (lambda p=a["path"]: os.startfile(p)) if a["type"] != "system" else (lambda p=a["path"]: win32api.ShellExecute(0, "open", p, None, None, 1))
+                results.append({"name": a["name"], "type": a["type"], "icon": a["icon"], "action": action})
     if not results:
         results.append({"name": f"Search web for '{q}'", "type": "web", "icon": "🔎", "action": lambda q=q: open_url("https://www.google.com/search?q=" + q)})
     show_results(results[:MAX_RESULTS])
@@ -381,7 +506,11 @@ def show():
     search_window.geometry(f"{WINDOW_WIDTH}x{ENTRY_HEIGHT}+{_origin_x}+{_origin_y}")
     entry.delete(0, tk.END)
     perform_search()
-    search_window.deiconify(); search_window.lift(); entry.focus_force()
+    search_window.deiconify()
+    search_window.lift()
+    hwnd = search_window.winfo_id()
+    ctypes.windll.user32.SetForegroundWindow(hwnd)
+    entry.focus_set()
     try:
         for a in (0.0, 0.25, 0.5, 0.8, 0.95):
             search_window.attributes("-alpha", a); search_window.update()
@@ -422,19 +551,49 @@ def setup_bindings():
     search_window.bind("<FocusOut>", on_focus_out)
 
 # ---------- HOTKEY ----------
-def _tk_call(fn): search_window.after(0, fn) if search_window else None
-def hotkey_thread():
+def register_hotkey():
+    global _hotkey_registered
+    try:
+        keyboard.unhook_all_hotkeys()
+    except:
+        pass
     try:
         keyboard.add_hotkey(HOTKEY, lambda: _tk_call(show))
-        keyboard.wait()
-    except Exception as e: print("[spotlight] hotkey error:", e)
+        _hotkey_registered = True
+        print(f"[spotlight] hotkey {HOTKEY} registered")
+    except Exception as e:
+        print("[spotlight] hotkey registration failed:", e)
+        _hotkey_registered = False
+
+def _tk_call(fn): 
+    if search_window: 
+        search_window.after(0, fn)
+
+def hotkey_thread():
+    global _hotkey_registered
+    while True:
+        if not _hotkey_registered:
+            register_hotkey()
+        time.sleep(5)
 
 # ---------- MAIN ----------
 def main():
-    index_apps()
+    # Index apps WITHOUT icons first (safe before Tk)
+    index_apps(extract_icons=False)
+    
+    # Create UI (now Tk exists)
     create_search_window()
     hide()
-    t = threading.Thread(target=hotkey_thread, daemon=True); t.start()
+    
+    # Now index WITH icons
+    index_apps(extract_icons=True)
+    
+    # Preload remaining icons in background (non-blocking)
+    threading.Thread(target=preload_icons_background, daemon=True).start()
+    
+    # Start hotkey watcher
+    threading.Thread(target=hotkey_thread, daemon=True).start()
+    
     print(f"[spotlight] ready — press {HOTKEY} to open")
     search_window.mainloop()
 
